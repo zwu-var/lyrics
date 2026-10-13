@@ -14,7 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let spotifyPollInterval: TimeInterval = 1.0
     /// Fast enough that a new line appears on time; the title is only touched when the line actually changes.
     private static let renderInterval: TimeInterval = 0.1
-    /// Avoids hammering LRCLIB every poll while offline.
+    /// Avoids hammering the lyrics sources every poll while offline.
     private static let lyricsRetryInterval: TimeInterval = 30
 
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -83,7 +83,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lyricsByTrack[track.id] = .loading
         Task {
             do {
-                lyricsByTrack[track.id] = .loaded(try await LRCLib.fetchLyrics(for: track))
+                lyricsByTrack[track.id] = .loaded(try await LyricsSources.fetchLyrics(for: track))
             } catch {
                 NSLog("LyricsBar: lyrics lookup failed for %@ by %@: %@", track.title, track.artist, String(describing: error))
                 lyricsByTrack[track.id] = .failed(at: ProcessInfo.processInfo.systemUptime)
@@ -118,7 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let track = nowPlaying.track
             let songName = "♪ \(track.title) – \(track.artist)"
             let text = switch lyricsByTrack[track.id] {
-            case .loaded(.synced(let lines)):
+            case .loaded(.synced(let lines, _)):
                 switch LRC.line(in: lines, at: nowPlaying.estimatedPosition(at: now)) {
                 // Before the first line, or an instrumental break (LRC marks those with an empty line).
                 case nil: songName
@@ -148,10 +148,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return "Spotify is stopped"
         case .success(.active(let nowPlaying)):
             let lyricsStatus = switch lyricsByTrack[nowPlaying.track.id] {
-            case .loaded(.synced(let lines)): "synced lyrics, \(lines.count) lines"
-            case .loaded(.unsyncedOnly): "LRCLIB has only unsynced lyrics"
+            case .loaded(.synced(let lines, let provider)): "synced lyrics from \(provider.rawValue), \(lines.count) lines"
+            case .loaded(.unsyncedOnly): "found lyrics, but none timed to this recording"
             case .loaded(.instrumental): "instrumental"
-            case .loaded(.notFound): "not found on LRCLIB"
+            case .loaded(.notFound): "no lyrics found on LRCLIB or NetEase"
             case .loading, nil: "looking up lyrics…"
             case .failed: "lookup failed, will retry"
             }

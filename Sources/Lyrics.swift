@@ -5,12 +5,57 @@ struct LyricLine {
     let text: String
 }
 
+enum LyricsProvider: String {
+    case lrclib = "LRCLIB"
+    case netEase = "NetEase"
+}
+
 enum Lyrics {
-    case synced([LyricLine])
-    /// LRCLIB knows the song but has no timestamps for it, so there is nothing to sync.
+    case synced([LyricLine], from: LyricsProvider)
+    /// The song was found, but without timestamps that fit this recording.
     case unsyncedOnly
     case instrumental
     case notFound
+}
+
+enum LyricsSources {
+    /// LRCLIB first: it's an open database with a documented API. NetEase's API is unofficial, but it covers
+    /// Chinese-language music (e.g. 90s Cantopop) that LRCLIB lacks.
+    private static let lookupOrder: [LyricsProvider] = [.lrclib, .netEase]
+
+    /// Throws only when no provider had synced lyrics and at least one failed, so the caller retries later
+    /// instead of remembering a "not found" that was really a network error.
+    static func fetchLyrics(for track: Track) async throws -> Lyrics {
+        var firstError: (any Error)?
+        var foundUnsynced = false
+        for provider in lookupOrder {
+            do {
+                let lyrics = try await fetchLyrics(for: track, from: provider)
+                switch lyrics {
+                case .synced, .instrumental:
+                    return lyrics
+                case .unsyncedOnly:
+                    foundUnsynced = true
+                case .notFound:
+                    break
+                }
+            } catch {
+                NSLog("LyricsBar: %@ lookup failed for %@: %@", provider.rawValue, track.title, String(describing: error))
+                firstError = firstError ?? error
+            }
+        }
+        if let firstError {
+            throw firstError
+        }
+        return foundUnsynced ? .unsyncedOnly : .notFound
+    }
+
+    private static func fetchLyrics(for track: Track, from provider: LyricsProvider) async throws -> Lyrics {
+        switch provider {
+        case .lrclib: try await LRCLib.fetchLyrics(for: track)
+        case .netEase: try await NetEase.fetchLyrics(for: track)
+        }
+    }
 }
 
 enum LRC {
@@ -50,111 +95,61 @@ enum LRC {
     }
 }
 
-enum LRCLibError: Error {
-    case http(status: Int)
+/// Deciding whether a lyrics database entry is the song Spotify is playing.
+enum SongMatching {
+    /// Lyrics are timed to one recording, and a different cut (radio edit, live) usually differs in length by more
+    /// than this. LRCLIB's own exact lookup allows ±2 s; this is a little more lenient.
+    static let maxDurationMismatch: TimeInterval = 5
+
+    /// Strips what Spotify and lyrics databases tend to disagree on: suffixes like " - Remastered 2011" and bracketed
+    /// parts like "(feat. Someone)" or "(Live)". Different versions are told apart by duration instead.
+    static func baseTitle(_ title: String) -> String {
+        let withoutDashSuffix = title.range(of: " - ").map { String(title[..<$0.lowerBound]) } ?? title
+        let withoutBrackets = withoutDashSuffix
+            .replacingOccurrences(of: #"\s*[(\[（【][^)\]）】]*[)\]）】]"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+        // A title that is nothing but brackets, e.g. "(Untitled)", is its own base title.
+        return withoutBrackets.isEmpty ? title : withoutBrackets
+    }
+
+    /// A form of a title or artist name for comparing across sources: ignores case, full-width vs half-width
+    /// characters, whitespace, and Traditional vs Simplified Chinese (Spotify has 吻別, NetEase stores 吻别).
+    static func comparable(_ name: String) -> String {
+        let simplified = name.applyingTransform(StringTransform("Hant-Hans"), reverse: false) ?? name
+        return simplified
+            .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
+            .filter { !$0.isWhitespace }
+    }
+
+    /// Rejects lyrics that can't be timed to this recording: untimed text with every line stamped at the same moment,
+    /// or lines running past the end of the song (e.g. a NetEase entry copied from a longer version).
+    static func isPlausible(_ lines: [LyricLine], forDuration duration: TimeInterval) -> Bool {
+        guard let first = lines.first, let last = lines.last else { return false }
+        return last.time > first.time && last.time <= duration
+    }
 }
 
-/// Client for https://lrclib.net, a free, open lyrics database (no API key).
-enum LRCLib {
-    private static let baseURL = URL(string: "https://lrclib.net/api")!
-
-    /// Search results come back loosely matched; a different cut of the song (radio edit, live) would have
-    /// differently timed lyrics. LRCLIB's own exact lookup allows ±2 s, so this is a bit more lenient.
-    private static let maxDurationMismatch: TimeInterval = 5
-
-    private struct Record: Decodable {
-        let duration: Double?
-        let instrumental: Bool?
-        let plainLyrics: String?
-        let syncedLyrics: String?
+enum HTTP {
+    struct UnexpectedResponse: Error {
+        let url: URL
+        let detail: String
     }
 
-    static func fetchLyrics(for track: Track) async throws -> Lyrics {
-        // LRCLIB answers some exact-lookup misses with 503 rather than 404, so any failure here falls through to
-        // search. If LRCLIB is actually unreachable, search throws and the caller sees that.
-        let exact = try? await getExact(track)
-        let exactSynced = exact?.syncedLyrics.map(LRC.parse) ?? []
-        if !exactSynced.isEmpty {
-            return .synced(exactSynced)
-        }
-        if exact?.instrumental == true {
-            return .instrumental
-        }
-
-        var candidates = try await search(title: track.title, artist: track.artist)
-        let simplified = simplifiedTitle(track.title)
-        if simplified != track.title {
-            candidates += try await search(title: simplified, artist: track.artist)
-        }
-
-        let closestSynced = candidates
-            .compactMap { record -> (mismatch: TimeInterval, lines: [LyricLine])? in
-                guard let duration = record.duration, let synced = record.syncedLyrics else { return nil }
-                let lines = LRC.parse(synced)
-                return lines.isEmpty ? nil : (abs(duration - track.duration), lines)
-            }
-            .filter { $0.mismatch <= maxDurationMismatch }
-            .min { $0.mismatch < $1.mismatch }
-
-        switch closestSynced {
-        case let match?:
-            return .synced(match.lines)
-        case nil where exact?.plainLyrics != nil || candidates.contains(where: { $0.plainLyrics != nil }):
-            return .unsyncedOnly
-        case nil:
-            return .notFound
-        }
-    }
-
-    /// Spotify titles often carry suffixes that LRCLIB entries lack,
-    /// e.g. "Song - Remastered 2011" or "Song (feat. Someone)".
-    static func simplifiedTitle(_ title: String) -> String {
-        let withoutDashSuffix = title.range(of: " - ").map { String(title[..<$0.lowerBound]) } ?? title
-        return withoutDashSuffix
-            .replacingOccurrences(
-                of: #"\s*[(\[](feat\.?|ft\.?|with)\s[^)\]]*[)\]]"#,
-                with: "",
-                options: [.regularExpression, .caseInsensitive]
-            )
-            .trimmingCharacters(in: .whitespaces)
-    }
-
-    private static func getExact(_ track: Track) async throws -> Record? {
-        let data = try await request(path: "get", query: [
-            "track_name": track.title,
-            "artist_name": track.artist,
-            "album_name": track.album,
-            "duration": String(Int(track.duration.rounded())),
-        ])
-        return try data.map { try JSONDecoder().decode(Record.self, from: $0) }
-    }
-
-    private static func search(title: String, artist: String) async throws -> [Record] {
-        let data = try await request(path: "search", query: ["track_name": title, "artist_name": artist])
-        return try data.map { try JSONDecoder().decode([Record].self, from: $0) } ?? []
-    }
-
-    /// Returns nil on 404, which LRCLIB uses for "no such track".
-    private static func request(path: String, query: [String: String]) async throws -> Data? {
-        var components = URLComponents(url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
+    static func get(_ url: URL, query: [String: String]) async throws -> (status: Int, body: Data) {
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
         components.queryItems = query.map { URLQueryItem(name: $0.key, value: $0.value) }
         // URLComponents leaves "+" unescaped, and servers commonly decode a bare "+" as a space.
         components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
 
         var request = URLRequest(url: components.url!)
-        // LRCLIB asks clients to identify themselves.
+        // LRCLIB asks clients to identify themselves; every source gets the same honest User-Agent.
         request.setValue("LyricsBar/1.0 (personal use)", forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 15
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        let status = (response as? HTTPURLResponse)?.statusCode
-        switch status {
-        case 200:
-            return data
-        case 404:
-            return nil
-        default:
-            throw LRCLibError.http(status: status ?? -1)
+        let (body, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw UnexpectedResponse(url: url, detail: "not an HTTP response")
         }
+        return (http.statusCode, body)
     }
 }
