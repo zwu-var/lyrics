@@ -1,0 +1,54 @@
+# Publishes a GitHub release with a zipped LyricsBar.app whenever a version tag is pushed:
+#   git tag v1.2.3 && git push origin v1.2.3
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release and upload its asset
+
+jobs:
+  release:
+    runs-on: macos-26
+    # A build takes about a minute; this only stops a hung job from burning macOS minutes (billed at 10x on private repos).
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Parse version from tag
+        run: |
+          # CFBundleShortVersionString must be dot-separated integers, so a tag like v1.2-beta has no valid bundle version.
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::Tag '$GITHUB_REF_NAME' must look like v1.2.3"
+            exit 1
+          fi
+          echo "VERSION=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+
+      - name: Stamp version into Info.plist
+        run: |
+          plutil -replace CFBundleShortVersionString -string "$VERSION" Info.plist
+          plutil -replace CFBundleVersion -string "$VERSION" Info.plist
+
+      - name: Build
+        run: ./build.sh
+
+      - name: Package
+        # ditto is Apple's recommended way to zip an app bundle: unlike zip, it keeps symlinks and extended attributes.
+        run: ditto -c -k --keepParent build/LyricsBar.app "build/LyricsBar-$VERSION.zip"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          INSTALL_NOTES: |
+            ## Install
+            Unzip and move `LyricsBar.app` to `/Applications`. The app is ad-hoc signed rather than notarized, so macOS refuses to open it until you clear the quarantine flag:
+            ```
+            xattr -dr com.apple.quarantine /Applications/LyricsBar.app
+            ```
+            After each update, macOS asks again for permission to control Spotify, because the ad-hoc signature changes with every build.
+        run: gh release create "$GITHUB_REF_NAME" "build/LyricsBar-$VERSION.zip" --verify-tag --generate-notes --notes "$INSTALL_NOTES"
